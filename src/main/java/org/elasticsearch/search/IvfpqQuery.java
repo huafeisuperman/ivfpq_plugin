@@ -17,15 +17,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.document.Document;
-import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.index.Term;
+import org.apache.lucene.index.*;
 import org.apache.lucene.queries.function.FunctionScoreQuery;
-import org.apache.lucene.search.DisjunctionMaxQuery;
-import org.apache.lucene.search.DoubleValues;
-import org.apache.lucene.search.DoubleValuesSource;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.*;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.analysis.IvfpqAnalyzer;
@@ -34,20 +28,18 @@ import org.elasticsearch.ann.ExactSearch;
 import org.elasticsearch.ann.ProductQuantizer;
 import org.elasticsearch.index.analysis.NamedAnalyzer;
 import org.elasticsearch.index.mapper.MappedFieldType;
+import org.elasticsearch.index.query.BoolQueryBuilder;
+import org.elasticsearch.index.query.MatchAllQueryBuilder;
+import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.QueryShardContext;
 import org.elasticsearch.mapper.IvfpqFieldMapper;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 
 class IvfpqQuery {
 
-    private static final Logger LOGGER = LogManager.getLogger(IvfpqQuery.class);
+    public static final Logger LOGGER = LogManager.getLogger(IvfpqQuery.class);
 
     private QueryShardContext context;
 
@@ -55,9 +47,11 @@ class IvfpqQuery {
         this.context = context;
     }
 
-    Query parse(Map<String, Float> fieldNames, Object value, int nprobe) {
+    Query parse(QueryBuilder in, Map<String, Float> fieldNames, Object value, int nprobe) throws IOException {
         float[] features = ArrayUtils.parseFloatArrayCsv((String) value);
-        List<Query> fieldQueries = new ArrayList<>();
+        //List<Query> fieldQueries = new ArrayList<>();
+        Query query = null;
+        long time1 = System.currentTimeMillis();
         for (String field : fieldNames.keySet()) {
             MappedFieldType fieldMapper = context.fieldMapper(field);
             Analyzer analyzer = context.getSearchAnalyzer(fieldMapper);
@@ -69,16 +63,24 @@ class IvfpqQuery {
             }
             ProductQuantizer pq = ((IvfpqAnalyzer) analyzer).getProductQuantizer();
             ExactSearch cq = ((IvfpqAnalyzer) analyzer).getCoarseQuantizer();
+            Map<String, float[]> tables = new HashMap<>();
+            List<BytesRef> nearCode = new ArrayList<>();
             for (int nearest : cq.searchNearest(features, nprobe)) {
                 float[] residual = cq.getResidual(nearest, features);
                 float[] table = pq.getCodeTable(residual);
-                Query query = new FunctionScoreQuery(
-                        new TermQuery(new Term(field, String.valueOf(nearest))),
-                        new CustomValueSource(field, pq, table));
-                fieldQueries.add(query);
+                String code = String.valueOf(nearest);
+                nearCode.add(new BytesRef(code));
+                tables.put(code, table);
             }
+            BooleanQuery.Builder builder = new BooleanQuery.Builder().
+                    add(new TermInSetQuery(field, nearCode), BooleanClause.Occur.FILTER);
+            if (!(in instanceof MatchAllQueryBuilder)) {
+                builder.add(in.toQuery(context), BooleanClause.Occur.FILTER).build();
+            }
+            query = new FunctionScoreQuery(builder.build(),
+                    new CustomValueSource(field, pq, tables));
         }
-        return new DisjunctionMaxQuery(fieldQueries, 1.0f);
+        return query;
     }
 
     private class CustomValueSource extends DoubleValuesSource {
@@ -87,9 +89,9 @@ class IvfpqQuery {
 
         private ProductQuantizer pq;
 
-        private float[] codeTable;
+        private Map<String, float[]> codeTable;
 
-        CustomValueSource(String field, ProductQuantizer pq, float[] codeTable) {
+        CustomValueSource(String field, ProductQuantizer pq, Map<String, float[]> codeTable) {
             this.field = field;
             this.pq = pq;
             this.codeTable = codeTable;
@@ -97,30 +99,44 @@ class IvfpqQuery {
 
         @Override
         public DoubleValues getValues(LeafReaderContext leafReaderContext, DoubleValues scores) {
-            return new DoubleValues() {
+            return new CustomDoubleValues(leafReaderContext);
+        }
 
-                private float value;
+        public class CustomDoubleValues extends DoubleValues {
 
-                @Override
-                public double doubleValue() {
-                    return value;
+            private float value;
+
+            private BinaryDocValues ivfDocValues;
+
+            private BinaryDocValues pgDocValues;
+
+            public CustomDoubleValues(LeafReaderContext leafReaderContext) {
+                try {
+                    ivfDocValues = DocValues.getBinary(leafReaderContext.reader(), field);
+                    pgDocValues = DocValues.getBinary(leafReaderContext.reader(), IvfpqFieldMapper.getCodesField(field));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
                 }
+            }
 
-                @Override
-                public boolean advanceExact(int doc) throws IOException {
-                    Document document = leafReaderContext.reader()
-                            .document(doc, new HashSet<>(Collections.singletonList(
-                                    IvfpqFieldMapper.getCodesField(field))));
-                    BytesRef bytesRef = document.getBinaryValue(
-                            IvfpqFieldMapper.getCodesField(field));
-                    if (bytesRef == null) {
-                        return false;
-                    }
-                    short[] codes = ArrayUtils.decodeShortArray(bytesRef.bytes);
-                    value = pq.getDistance(codeTable, codes);
-                    return true;
+            @Override
+            public double doubleValue() {
+                return value;
+            }
+
+            @Override
+            public boolean advanceExact(int doc) throws IOException {
+                ivfDocValues.advanceExact(doc);
+                pgDocValues.advanceExact(doc);
+                byte[] pqCode = pgDocValues.binaryValue().bytes;
+                String nearest = ivfDocValues.binaryValue().utf8ToString();
+                if (pqCode == null || nearest == null) {
+                    return false;
                 }
-            };
+                short[] codes = ArrayUtils.decodeShortArray(pqCode);
+                value = pq.getDistance(codeTable.get(nearest), codes);
+                return true;
+            }
         }
 
         @Override

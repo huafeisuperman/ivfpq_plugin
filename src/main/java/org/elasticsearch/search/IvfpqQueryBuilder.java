@@ -15,12 +15,15 @@ package org.elasticsearch.search;
 
 import org.apache.lucene.search.Query;
 import org.elasticsearch.common.ParseField;
+import org.elasticsearch.common.ParsingException;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.xcontent.DeprecationHandler;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentParser;
 import org.elasticsearch.index.query.AbstractQueryBuilder;
+import org.elasticsearch.index.query.MatchAllQueryBuilder;
+import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.QueryShardContext;
 
 import java.io.IOException;
@@ -36,6 +39,8 @@ public class IvfpqQueryBuilder extends AbstractQueryBuilder<IvfpqQueryBuilder> {
 
     private static final ParseField QUERY_FIELD = new ParseField("query");
 
+    private static final ParseField COMMON_QUERY_FIELD = new ParseField("common_query");
+
     private static final ParseField FIELDS_FIELD = new ParseField("fields");
 
     private static final ParseField NPROBE_FIELD = new ParseField("nprobe");
@@ -46,17 +51,21 @@ public class IvfpqQueryBuilder extends AbstractQueryBuilder<IvfpqQueryBuilder> {
 
     private int nprobe;
 
-    private IvfpqQueryBuilder(Object value, Map<String, Float> fieldsBoosts, int nprobe) {
+    private QueryBuilder query;
+
+    private IvfpqQueryBuilder(QueryBuilder query, Object value, Map<String, Float> fieldsBoosts, int nprobe) {
         if (value == null) {
             throw new IllegalArgumentException("[" + NAME + "] requires query value");
         }
         this.value = value;
         this.fieldsBoosts = fieldsBoosts;
         this.nprobe = nprobe;
+        this.query = query;
     }
 
     public IvfpqQueryBuilder(StreamInput in) throws IOException {
         super(in);
+        query = in.readNamedWriteable(QueryBuilder.class);
         value = in.readGenericValue();
         nprobe = in.readVInt();
         int size = in.readVInt();
@@ -68,6 +77,7 @@ public class IvfpqQueryBuilder extends AbstractQueryBuilder<IvfpqQueryBuilder> {
 
     @Override
     protected void doWriteTo(StreamOutput streamOutput) throws IOException {
+        streamOutput.writeNamedWriteable(query);
         streamOutput.writeGenericValue(value);
         streamOutput.writeVInt(nprobe);
         streamOutput.writeVInt(fieldsBoosts.size());
@@ -80,6 +90,10 @@ public class IvfpqQueryBuilder extends AbstractQueryBuilder<IvfpqQueryBuilder> {
     @Override
     protected void doXContent(XContentBuilder xContentBuilder, Params params) throws IOException {
         xContentBuilder.startObject(NAME);
+        if (query != null) {
+            xContentBuilder.field(COMMON_QUERY_FIELD.getPreferredName());
+            query.toXContent(xContentBuilder, params);
+        }
         xContentBuilder.field(QUERY_FIELD.getPreferredName(), value);
         xContentBuilder.field(NPROBE_FIELD.getPreferredName(), nprobe);
         xContentBuilder.startArray(FIELDS_FIELD.getPreferredName());
@@ -91,9 +105,9 @@ public class IvfpqQueryBuilder extends AbstractQueryBuilder<IvfpqQueryBuilder> {
     }
 
     @Override
-    protected Query doToQuery(QueryShardContext queryShardContext) {
+    protected Query doToQuery(QueryShardContext queryShardContext) throws IOException {
         IvfpqQuery ivfpqQuery = new IvfpqQuery(queryShardContext);
-        return ivfpqQuery.parse(fieldsBoosts, value, nprobe);
+        return ivfpqQuery.parse(query, fieldsBoosts, value, nprobe);
     }
 
     @Override
@@ -115,12 +129,23 @@ public class IvfpqQueryBuilder extends AbstractQueryBuilder<IvfpqQueryBuilder> {
     public static IvfpqQueryBuilder fromXContent(XContentParser parser) throws IOException {
         Object value = null;
         int nprobe = DEFAULT_NPROBE;
+        QueryBuilder query = null;
         Map<String, Float> fieldsBoosts = new TreeMap<>();
         XContentParser.Token token;
         String currentFieldName = null;
         while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
             if (token == XContentParser.Token.FIELD_NAME) {
                 currentFieldName = parser.currentName();
+            } else if (token == XContentParser.Token.START_OBJECT) {
+                if (COMMON_QUERY_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
+                    if (query != null) {
+                        throw new ParsingException(parser.getTokenLocation(), "failed to parse [{}] query. [query] is already defined.",
+                                NAME);
+                    }
+                    query = parseInnerQueryBuilder(parser);
+                } else {
+                    throw new ParsingException(parser.getTokenLocation(),"can not start with {}");
+                }
             } else if (FIELDS_FIELD
                     .match(currentFieldName, DeprecationHandler.THROW_UNSUPPORTED_OPERATION)) {
                 if (token == XContentParser.Token.START_ARRAY) {
@@ -139,7 +164,10 @@ public class IvfpqQueryBuilder extends AbstractQueryBuilder<IvfpqQueryBuilder> {
                 }
             }
         }
-        return new IvfpqQueryBuilder(value, fieldsBoosts, nprobe);
+        if (query == null) {
+            query = new MatchAllQueryBuilder();
+        }
+        return new IvfpqQueryBuilder(query, value, fieldsBoosts, nprobe);
     }
 
     private static void parseFieldAndBoost(XContentParser parser, Map<String, Float> fieldsBoosts)

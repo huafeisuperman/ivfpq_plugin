@@ -17,9 +17,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.StoredField;
-import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.*;
+import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BoostQuery;
@@ -86,9 +85,12 @@ public class IvfpqFieldMapper extends FieldMapper {
             final CodeAttribute codeAttribute = tokenStream.addAttribute(CodeAttribute.class);
             tokenStream.reset();
             if (tokenStream.incrementToken()) {
-                fields.add(new StringField(name(), charTermAttribute.toString(), Field.Store.NO));
+                String termValue = charTermAttribute.toString();
+                fields.add(new StringField(name(), termValue, Field.Store.NO));
                 BytesRef bytes = new BytesRef(ArrayUtils.encodeShortArray(codeAttribute.getCodes()));
-                fields.add(new StoredField(getCodesField(name()), bytes));
+                //fields.add(new StoredField(getCodesField(name()), bytes));
+                fields.add(new BinaryDocValuesField(name(), new BytesRef(termValue)));
+                fields.add(new BinaryDocValuesField(getCodesField(name()), bytes));
             }
             tokenStream.end();
         }
